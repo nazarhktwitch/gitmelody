@@ -6,6 +6,7 @@ import hashlib
 import math
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -31,6 +32,17 @@ Commit = namedtuple('Commit', ['hash', 'author', 'email', 'date', 'subject', 'pa
 Note = namedtuple('Note', ['start', 'duration', 'pitches', 'velocity', 'email'])
 
 
+def remove_tree(path):
+    # git leaves read-only files behind, which rmtree cannot delete on Windows
+    for root, dirs, files in os.walk(path):
+        for name in dirs + files:
+            try:
+                os.chmod(os.path.join(root, name), stat.S_IWRITE)
+            except OSError:
+                pass
+    shutil.rmtree(path, ignore_errors=True)
+
+
 def is_url(path):
     if '://' in path:
         return True
@@ -45,12 +57,24 @@ def run_git(args):
     return subprocess.run(['git'] + args, capture_output=True)
 
 
-def clone_bare(url):
+def clone_bare(url, max_commits=None):
     tmp = tempfile.mkdtemp(prefix='gitmelody-')
-    proc = run_git(['clone', '--bare', url, tmp])
+    print('cloning {} (this can take a while)...'.format(url), file=sys.stderr)
+    cmd = ['git', 'clone', '--progress', '--bare']
+    if max_commits:
+        # blobless clone: fetch history now, blobs for the kept commits on demand
+        cmd.append('--filter=blob:none')
+    cmd.extend([url, tmp])
+    proc = subprocess.Popen(cmd, stderr=subprocess.PIPE)
+    captured = []
+    for raw in proc.stderr:
+        captured.append(raw)
+        sys.stderr.write(raw.decode('utf-8', 'replace'))
+        sys.stderr.flush()
+    proc.wait()
     if proc.returncode != 0:
-        shutil.rmtree(tmp, ignore_errors=True)
-        err = proc.stderr.decode('utf-8', 'replace').strip()
+        remove_tree(tmp)
+        err = b''.join(captured).decode('utf-8', 'replace').strip()
         print(' '.join(err.split()), file=sys.stderr)
         sys.exit(1)
     return tmp
@@ -99,15 +123,25 @@ def fetch_commits(repo_path, args):
         cmd.append('--since=' + args.since)
     if args.until:
         cmd.append('--until=' + args.until)
-    proc = run_git(cmd)
+    if args.max_commits:
+        cmd.extend(['--max-count', str(args.max_commits)])
+    print('reading history...', file=sys.stderr)
+    proc = subprocess.Popen(['git'] + cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    chunks = []
+    count = 0
+    for raw in proc.stdout:
+        chunks.append(raw)
+        if raw.count(b'\x1f') >= 5:
+            count += 1
+            if count % 1000 == 0:
+                print('read {} commits...'.format(count), file=sys.stderr)
+    proc.wait()
     if proc.returncode != 0:
-        err = proc.stderr.decode('utf-8', 'replace').strip()
+        err = proc.stderr.read().decode('utf-8', 'replace').strip()
         print(' '.join(err.split()) or 'git log failed', file=sys.stderr)
         sys.exit(1)
-    commits = parse_log(proc.stdout.decode('utf-8', 'replace'))
+    commits = parse_log(b''.join(chunks).decode('utf-8', 'replace'))
     commits.reverse()
-    if args.max_commits and len(commits) > args.max_commits:
-        commits = commits[-args.max_commits:]
     return commits
 
 
@@ -233,7 +267,9 @@ def write_wav(path, notes, tempo_bpm):
     seconds_per_tick = 60.0 / (tempo_bpm * TICKS_PER_BEAT)
     total_ticks = notes[-1].start + notes[-1].duration
     buf = array('f', [0.0]) * int(total_ticks * seconds_per_tick * SAMPLE_RATE + 1)
-    for note in notes:
+    for i, note in enumerate(notes):
+        if i % 1000 == 0:
+            print('synthesized {}/{} notes...'.format(i, len(notes)), file=sys.stderr)
         start = int(note.start * seconds_per_tick * SAMPLE_RATE)
         mix_note(buf, start, note.duration * seconds_per_tick, note.pitches, note.velocity)
     frames = array('h')
@@ -268,7 +304,7 @@ def main(argv):
         sys.exit(1)
     tmp_dir = None
     if is_url(args.repo):
-        repo_path = clone_bare(args.repo)
+        repo_path = clone_bare(args.repo, args.max_commits)
         tmp_dir = repo_path
     else:
         repo_path = args.repo
@@ -283,8 +319,10 @@ def main(argv):
         notes = commits_to_notes(commits)
         ext = os.path.splitext(args.output)[1].lower()
         if ext == '.mid':
+            print('writing {}...'.format(args.output), file=sys.stderr)
             write_midi(args.output, notes, args.tempo, args.instrument_map)
         elif ext == '.wav':
+            print('writing {}...'.format(args.output), file=sys.stderr)
             write_wav(args.output, notes, args.tempo)
         else:
             print('unknown output format: ' + ext + ' (use .mid or .wav)', file=sys.stderr)
@@ -292,7 +330,7 @@ def main(argv):
         print('wrote {} notes to {}'.format(len(notes), args.output))
     finally:
         if tmp_dir:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+            remove_tree(tmp_dir)
 
 
 if __name__ == '__main__':
