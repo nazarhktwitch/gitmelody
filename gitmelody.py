@@ -2,6 +2,7 @@
 """Turn a git repository's commit history into a MIDI or WAV file"""
 
 import argparse
+import codecs
 import hashlib
 import math
 import os
@@ -10,6 +11,8 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import wave
 from array import array
 from collections import namedtuple
@@ -57,21 +60,49 @@ def run_git(args):
     return subprocess.run(['git'] + args, capture_output=True)
 
 
-def clone_bare(url, max_commits=None):
+def stream_stderr(proc):
+    # an unread stderr pipe fills up and blocks git forever; git progress
+    # updates arrive separated by \r, so split on both to show them live
+    captured = []
+
+    def pump():
+        decoder = codecs.getincrementaldecoder('utf-8')('replace')
+        keep_cr = sys.stderr.isatty()
+        while True:
+            raw = proc.stderr.read1(4096)
+            if not raw:
+                break
+            captured.append(raw)
+            text = decoder.decode(raw)
+            sys.stderr.write(text if keep_cr else text.replace('\r', '\n'))
+            sys.stderr.flush()
+        sys.stderr.write(decoder.decode(b'', True))
+        sys.stderr.flush()
+
+    thread = threading.Thread(target=pump, daemon=True)
+    thread.start()
+    return captured, thread
+
+
+def clone_bare(url):
     tmp = tempfile.mkdtemp(prefix='gitmelody-')
     print('cloning {} (this can take a while)...'.format(url), file=sys.stderr)
-    cmd = ['git', 'clone', '--progress', '--bare']
-    if max_commits:
-        # blobless clone: fetch history now, blobs for the kept commits on demand
-        cmd.append('--filter=blob:none')
-    cmd.extend([url, tmp])
-    proc = subprocess.Popen(cmd, stderr=subprocess.PIPE)
-    captured = []
-    for raw in proc.stderr:
-        captured.append(raw)
-        sys.stderr.write(raw.decode('utf-8', 'replace'))
-        sys.stderr.flush()
-    proc.wait()
+    proc = subprocess.Popen(['git', 'clone', '--progress', '--bare', url, tmp],
+                            stderr=subprocess.PIPE)
+    captured, thread = stream_stderr(proc)
+    start = time.monotonic()
+    last_len = 0
+    last_change = start
+    while proc.poll() is None:
+        time.sleep(0.5)
+        if len(captured) != last_len:
+            last_len = len(captured)
+            last_change = time.monotonic()
+        elif time.monotonic() - last_change >= 10:
+            print('still cloning... ({}s)'.format(int(time.monotonic() - start)),
+                  file=sys.stderr)
+            last_change = time.monotonic()
+    thread.join()
     if proc.returncode != 0:
         remove_tree(tmp)
         err = b''.join(captured).decode('utf-8', 'replace').strip()
@@ -127,6 +158,7 @@ def fetch_commits(repo_path, args):
         cmd.extend(['--max-count', str(args.max_commits)])
     print('reading history...', file=sys.stderr)
     proc = subprocess.Popen(['git'] + cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    captured, thread = stream_stderr(proc)
     chunks = []
     count = 0
     for raw in proc.stdout:
@@ -136,8 +168,9 @@ def fetch_commits(repo_path, args):
             if count % 1000 == 0:
                 print('read {} commits...'.format(count), file=sys.stderr)
     proc.wait()
+    thread.join()
     if proc.returncode != 0:
-        err = proc.stderr.read().decode('utf-8', 'replace').strip()
+        err = b''.join(captured).decode('utf-8', 'replace').strip()
         print(' '.join(err.split()) or 'git log failed', file=sys.stderr)
         sys.exit(1)
     commits = parse_log(b''.join(chunks).decode('utf-8', 'replace'))
@@ -164,7 +197,8 @@ def pitch(hour):
 
 
 def rest_ticks(gap_seconds):
-    hours = gap_seconds / 3600.0
+    # author dates jump backwards on rebase/cherry-pick, so clamp the gap
+    hours = max(0.0, gap_seconds / 3600.0)
     factor = math.log10(1 + hours) / math.log10(1 + MAX_GAP_HOURS)
     return int(round(factor * MAX_REST_TICKS))
 
@@ -304,7 +338,7 @@ def main(argv):
         sys.exit(1)
     tmp_dir = None
     if is_url(args.repo):
-        repo_path = clone_bare(args.repo, args.max_commits)
+        repo_path = clone_bare(args.repo)
         tmp_dir = repo_path
     else:
         repo_path = args.repo
